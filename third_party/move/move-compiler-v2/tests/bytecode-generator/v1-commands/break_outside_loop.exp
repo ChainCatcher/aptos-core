@@ -1,12 +1,16 @@
-// ---- Model Dump
+// -- Model dump before bytecode pipeline
 module <SELF>_0 {
     private fun main() {
         break
     }
-    spec fun $main() {
+} // end <SELF>_0
+
+// -- Sourcified model before bytecode pipeline
+script {
+    fun main() {
         break
     }
-} // end <SELF>_0
+}
 
 
 Diagnostics:

@@ -16,6 +16,7 @@
 # fast fail.
 set -eo pipefail
 
+NODE_MAJOR_VERSION=20
 SHELLCHECK_VERSION=0.7.1
 GRCOV_VERSION=0.8.2
 KUBECTL_VERSION=1.18.6
@@ -25,11 +26,10 @@ VAULT_VERSION=1.5.0
 Z3_VERSION=4.11.2
 CVC5_VERSION=0.0.3
 DOTNET_VERSION=6.0
-BOOGIE_VERSION=3.0.9
+BOOGIE_VERSION=3.2.4
 ALLURE_VERSION=2.15.pr1135
 # this is 3.21.4; the "3" is silent
 PROTOC_VERSION=21.4
-SOLC_VERSION="v0.8.11+commit.d7f03943"
 
 SCRIPT_PATH="$(cd "$(dirname "$0")" >/dev/null 2>&1 && pwd)"
 cd "$SCRIPT_PATH/.." || exit
@@ -44,12 +44,12 @@ function usage {
   echo "-o install operations tooling as well: helm, terraform, yamllint, vault, docker, kubectl, python3"
   echo "-y install or update Move Prover tools: z3, cvc5, dotnet, boogie"
   echo "-d install tools for the Move documentation generator: graphviz"
-  echo "-a install tools for build and test api"
   echo "-P install PostgreSQL"
   echo "-J install js/ts tools"
   echo "-v verbose mode"
   echo "-i installs an individual tool by name"
   echo "-n will target the /opt/ dir rather than the $HOME dir.  /opt/bin/, /opt/rustup/, and /opt/dotnet/ rather than $HOME/bin/, $HOME/.rustup/, and $HOME/.dotnet/"
+  echo "-k skip pre-commit"
   echo "If no toolchain component is selected with -t, -o, -y, -d, or -p, the behavior is as if -t had been provided."
   echo "This command must be called from the root folder of the Aptos-core project."
 }
@@ -95,7 +95,6 @@ function update_path_and_profile {
     add_to_profile "export CVC5_EXE=\"${BIN_DIR}/cvc5\""
     add_to_profile "export BOOGIE_EXE=\"${DOTNET_ROOT}/tools/boogie\""
   fi
-  add_to_profile "export SOLC_EXE=\"${BIN_DIR}/solc\""
 }
 
 function install_build_essentials {
@@ -145,9 +144,9 @@ function install_protoc {
   (
     cd "$TMPFILE" || exit
     curl -LOs "https://github.com/protocolbuffers/protobuf/releases/download/v$PROTOC_VERSION/$PROTOC_PKG.zip" --retry 3
-    sudo unzip -o "$PROTOC_PKG.zip" -d /usr/local bin/protoc
-    sudo unzip -o "$PROTOC_PKG.zip" -d /usr/local 'include/*'
-    sudo chmod +x "/usr/local/bin/protoc"
+    "${PRE_COMMAND[@]}" unzip -o "$PROTOC_PKG.zip" -d /usr/local bin/protoc
+    "${PRE_COMMAND[@]}" unzip -o "$PROTOC_PKG.zip" -d /usr/local 'include/*'
+    "${PRE_COMMAND[@]}" chmod +x "/usr/local/bin/protoc"
   )
   rm -rf "$TMPFILE"
 
@@ -459,13 +458,9 @@ function install_toolchain {
 }
 
 function install_rustup_components_and_nightly {
-  echo "Printing the rustup version and toolchain list"
-  rustup --version
-  rustup show
-  rustup toolchain list -v
-
-  echo "Updating rustup and installing rustfmt & clippy"
+  echo "Updating rustup and installing the latest rustc, rustfmt & clippy"
   rustup update
+  rustup toolchain install stable # Install the latest toolchain to ensure that dependencies can always be built (even if aptos-core is behind)
   rustup component add rustfmt
   rustup component add clippy
 
@@ -488,6 +483,11 @@ function install_rustup_components_and_nightly {
   if ! rustup component add rustfmt --toolchain nightly; then
     echo "Failed to install rustfmt nightly using rustup."
   fi
+
+  echo "Printing the rustup version and toolchain list"
+  rustup --version
+  rustup show
+  rustup toolchain list -v
 }
 
 function install_cargo_sort {
@@ -496,9 +496,15 @@ function install_cargo_sort {
   fi
 }
 
+function install_cargo_machete {
+  if ! command -v cargo-machete &>/dev/null; then
+    cargo install cargo-machete --locked --version 0.7.0
+  fi
+}
+
 function install_cargo_nextest {
   if ! command -v cargo-nextest &>/dev/null; then
-    cargo install cargo-nextest --locked
+    cargo install cargo-nextest --locked --version 0.9.85
   fi
 }
 
@@ -535,7 +541,7 @@ function install_dotnet {
     # Below we need to (a) set TERM variable because the .net installer expects it and it is not set
     # in some environments (b) use bash not sh because the installer uses bash features.
     # NOTE: use wget to better follow the redirect
-    wget https://dot.net/v1/dotnet-install.sh -O dotnet-install.sh
+    wget --tries 10 --retry-connrefused --waitretry=5 https://dot.net/v1/dotnet-install.sh -O dotnet-install.sh
     chmod +x dotnet-install.sh
     ./dotnet-install.sh --channel $DOTNET_VERSION --install-dir "${DOTNET_INSTALL_DIR}" --version latest
     rm dotnet-install.sh
@@ -648,31 +654,11 @@ function install_xsltproc {
 
 function install_nodejs {
   if [[ "$PACKAGE_MANAGER" == "apt-get" ]]; then
-    # install via nodesource: https://github.com/nodesource/distributions/issues/1709#issuecomment-1788473588
-    NODE_MAJOR=18
-    echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_$NODE_MAJOR.x nodistro main" | sudo tee /etc/apt/sources.list.d/nodesource.list
+    curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR_VERSION}.x" -o nodesource_setup.sh
+    "${PRE_COMMAND[@]}" -E bash nodesource_setup.sh
   fi
   install_pkg nodejs "$PACKAGE_MANAGER"
   install_pkg npm "$PACKAGE_MANAGER"
-}
-
-function install_solidity {
-  echo "Installing Solidity compiler"
-  if [ -f "${INSTALL_DIR}solc" ]; then
-    echo "Solidity already installed at ${INSTALL_DIR}solc"
-    return
-  fi
-  # We fetch the binary from  https://binaries.soliditylang.org
-  if [[ "$(uname)" == "Linux" ]]; then
-    SOLC_BIN="linux-amd64/solc-linux-amd64-${SOLC_VERSION}"
-  elif [[ "$(uname)" == "Darwin" ]]; then
-    SOLC_BIN="macosx-amd64/solc-macosx-amd64-${SOLC_VERSION}"
-  else
-    echo "Solidity support not configured for this platform (uname=$(uname))"
-    return
-  fi
-  curl -o "${INSTALL_DIR}solc" "https://binaries.soliditylang.org/${SOLC_BIN}"
-  chmod +x "${INSTALL_DIR}solc"
 }
 
 function install_pnpm {
@@ -793,13 +779,6 @@ protoc and related plugins (since -r was provided):
 EOF
   fi
 
-  if [[ "$INSTALL_API_BUILD_TOOLS" == "true" ]]; then
-    cat <<EOF
-API build and testing tools (since -a was provided):
-  * Python3 (schemathesis)
-EOF
-  fi
-
   if [[ "$INSTALL_POSTGRES" == "true" ]]; then
     cat <<EOF
 PostgreSQL database (since -P was provided):
@@ -811,7 +790,6 @@ EOF
 Javascript/TypeScript tools (since -J was provided):
   * node.js
   * pnpm
-  * solidity
 EOF
   fi
 
@@ -840,16 +818,16 @@ INSTALL_PROFILE=false
 INSTALL_PROVER=false
 INSTALL_DOC=false
 INSTALL_PROTOC=false
-INSTALL_API_BUILD_TOOLS=false
 INSTALL_POSTGRES=false
 INSTALL_JSTS=false
 INSTALL_INDIVIDUAL=false
 INSTALL_PACKAGES=()
 INSTALL_DIR="${HOME}/bin/"
 OPT_DIR="false"
+SKIP_PRE_COMMIT=false
 
 #parse args
-while getopts "btoprvydaPJh:i:n" arg; do
+while getopts "btoprvydaPJh:i:nk" arg; do
   case "$arg" in
   b)
     BATCH_MODE="true"
@@ -875,9 +853,6 @@ while getopts "btoprvydaPJh:i:n" arg; do
   d)
     INSTALL_DOC="true"
     ;;
-  a)
-    INSTALL_API_BUILD_TOOLS="true"
-    ;;
   P)
     INSTALL_POSTGRES="true"
     ;;
@@ -891,6 +866,9 @@ while getopts "btoprvydaPJh:i:n" arg; do
     ;;
   n)
     OPT_DIR="true"
+    ;;
+  k)
+    SKIP_PRE_COMMIT="true"
     ;;
   *)
     usage
@@ -908,7 +886,6 @@ if [[ "$INSTALL_BUILD_TOOLS" == "false" ]] &&
   [[ "$INSTALL_PROFILE" == "false" ]] &&
   [[ "$INSTALL_PROVER" == "false" ]] &&
   [[ "$INSTALL_DOC" == "false" ]] &&
-  [[ "$INSTALL_API_BUILD_TOOLS" == "false" ]] &&
   [[ "$INSTALL_POSTGRES" == "false" ]] &&
   [[ "$INSTALL_JSTS" == "false" ]] &&
   [[ "$INSTALL_INDIVIDUAL" == "false" ]]; then
@@ -1005,6 +982,7 @@ if [[ "$INSTALL_BUILD_TOOLS" == "true" ]]; then
   install_rustup_components_and_nightly
 
   install_cargo_sort
+  install_cargo_machete
   install_cargo_nextest
   install_grcov
   install_pkg git "$PACKAGE_MANAGER"
@@ -1070,12 +1048,6 @@ if [[ "$INSTALL_DOC" == "true" ]]; then
   install_pkg graphviz "$PACKAGE_MANAGER"
 fi
 
-if [[ "$INSTALL_API_BUILD_TOOLS" == "true" ]]; then
-  # python and tools
-  install_python3
-  "${PRE_COMMAND[@]}" python3 -m pip install schemathesis
-fi
-
 if [[ "$INSTALL_POSTGRES" == "true" ]]; then
   install_postgres
 fi
@@ -1084,22 +1056,24 @@ if [[ "$INSTALL_JSTS" == "true" ]]; then
   # javascript and typescript tools
   install_nodejs "$PACKAGE_MANAGER"
   install_pnpm "$PACKAGE_MANAGER"
-  install_solidity
 fi
+
+install_libudev-dev
 
 install_python3
-if [[ "$PACKAGE_MANAGER" != "pacman" ]]; then
-  pip3 install pre-commit
-  install_libudev-dev
-else
-  install_pkg python-pre-commit "$PACKAGE_MANAGER"
-fi
+if [[ "$SKIP_PRE_COMMIT" == "false" ]]; then
+  if [[ "$PACKAGE_MANAGER" != "pacman" ]]; then
+    pip3 install pre-commit
+  else
+    install_pkg python-pre-commit "$PACKAGE_MANAGER"
+  fi
 
-# For now best effort install, will need to improve later
-if command -v pre-commit; then
-  pre-commit install
-else
-  ~/.local/bin/pre-commit install
+  # For now best effort install, will need to improve later
+  if command -v pre-commit; then
+    pre-commit install
+  else
+    ~/.local/bin/pre-commit install
+  fi
 fi
 
 if [[ "${BATCH_MODE}" == "false" ]]; then

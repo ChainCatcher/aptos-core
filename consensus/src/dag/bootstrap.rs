@@ -1,4 +1,5 @@
 // Copyright © Aptos Foundation
+// SPDX-License-Identifier: Apache-2.0
 
 use super::{
     adapter::{OrderedNotifierAdapter, TLedgerInfoProvider},
@@ -31,7 +32,7 @@ use crate::{
     monitor,
     network::IncomingDAGRequest,
     payload_client::PayloadClient,
-    payload_manager::PayloadManager,
+    payload_manager::TPayloadManager,
     pipeline::{buffer_manager::OrderedBlocks, execution_client::TExecutionClient},
 };
 use aptos_bounded_executor::BoundedExecutor;
@@ -47,9 +48,10 @@ use aptos_reliable_broadcast::{RBNetworkSender, ReliableBroadcast};
 use aptos_types::{
     epoch_state::EpochState,
     on_chain_config::{
-        AnchorElectionMode, DagConsensusConfigV1, FeatureFlag, Features,
+        AnchorElectionMode, DagConsensusConfigV1,
         LeaderReputationType::{ProposerAndVoter, ProposerAndVoterV2},
-        ProposerAndVoterConfig, ValidatorTxnConfig,
+        OnChainJWKConsensusConfig, OnChainRandomnessConfig, ProposerAndVoterConfig,
+        ValidatorTxnConfig,
     },
     validator_signer::ValidatorSigner,
 };
@@ -59,7 +61,7 @@ use futures_channel::{
     mpsc::{UnboundedReceiver, UnboundedSender},
     oneshot,
 };
-use std::{collections::HashMap, fmt, ops::Deref, sync::Arc, time::Duration};
+use std::{fmt, ops::Deref, sync::Arc, time::Duration};
 use tokio::{
     runtime::Handle,
     select,
@@ -328,14 +330,16 @@ pub struct DagBootstrapper {
     dag_network_sender: Arc<dyn TDAGNetworkSender>,
     proof_notifier: Arc<dyn ProofNotifier>,
     time_service: aptos_time_service::TimeService,
-    payload_manager: Arc<PayloadManager>,
+    payload_manager: Arc<dyn TPayloadManager>,
     payload_client: Arc<dyn PayloadClient>,
     ordered_nodes_tx: UnboundedSender<OrderedBlocks>,
     execution_client: Arc<dyn TExecutionClient>,
     quorum_store_enabled: bool,
     vtxn_config: ValidatorTxnConfig,
+    randomness_config: OnChainRandomnessConfig,
+    jwk_consensus_config: OnChainJWKConsensusConfig,
     executor: BoundedExecutor,
-    features: Features,
+    allow_batches_without_pos_in_proposal: bool,
 }
 
 impl DagBootstrapper {
@@ -351,14 +355,16 @@ impl DagBootstrapper {
         dag_network_sender: Arc<dyn TDAGNetworkSender>,
         proof_notifier: Arc<dyn ProofNotifier>,
         time_service: aptos_time_service::TimeService,
-        payload_manager: Arc<PayloadManager>,
+        payload_manager: Arc<dyn TPayloadManager>,
         payload_client: Arc<dyn PayloadClient>,
         ordered_nodes_tx: UnboundedSender<OrderedBlocks>,
         execution_client: Arc<dyn TExecutionClient>,
         quorum_store_enabled: bool,
         vtxn_config: ValidatorTxnConfig,
+        randomness_config: OnChainRandomnessConfig,
+        jwk_consensus_config: OnChainJWKConsensusConfig,
         executor: BoundedExecutor,
-        features: Features,
+        allow_batches_without_pos_in_proposal: bool,
     ) -> Self {
         Self {
             self_peer,
@@ -377,8 +383,10 @@ impl DagBootstrapper {
             execution_client,
             quorum_store_enabled,
             vtxn_config,
+            randomness_config,
+            jwk_consensus_config,
             executor,
-            features,
+            allow_batches_without_pos_in_proposal,
         }
     }
 
@@ -387,18 +395,28 @@ impl DagBootstrapper {
         config: &ProposerAndVoterConfig,
     ) -> Arc<LeaderReputationAdapter> {
         let num_validators = self.epoch_state.verifier.len();
-        // TODO: support multiple epochs
+        let epoch_to_validators_vec = self.storage.get_epoch_to_proposers();
+        let epoch_to_validator_map = epoch_to_validators_vec
+            .iter()
+            .map(|(key, value)| {
+                (
+                    *key,
+                    value
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, author)| (*author, idx))
+                        .collect(),
+                )
+            })
+            .collect();
         let metadata_adapter = Arc::new(MetadataBackendAdapter::new(
-            num_validators * 10,
-            HashMap::from([(
-                self.epoch_state.epoch,
-                self.epoch_state
-                    .verifier
-                    .address_to_validator_index()
-                    .clone(),
-            )]),
+            num_validators
+                * std::cmp::max(
+                    config.proposer_window_num_validators_multiplier,
+                    config.voter_window_num_validators_multiplier,
+                ),
+            epoch_to_validator_map,
         ));
-        // TODO: use onchain config
         let heuristic: Box<dyn ReputationHeuristic> = Box::new(ProposerAndVoterHeuristic::new(
             self.self_peer,
             config.active_weight,
@@ -414,15 +432,17 @@ impl DagBootstrapper {
             .epoch_state
             .verifier
             .get_ordered_account_addresses_iter()
-            .map(|p| self.epoch_state.verifier.get_voting_power(&p).unwrap())
+            .map(|p| {
+                self.epoch_state
+                    .verifier
+                    .get_voting_power(&p)
+                    .expect("No voting power associated with AccountAddress!")
+            })
             .collect();
 
         Arc::new(LeaderReputationAdapter::new(
             self.epoch_state.epoch,
-            HashMap::from([(
-                self.epoch_state.epoch,
-                self.epoch_state.verifier.get_ordered_account_addresses(),
-            )]),
+            epoch_to_validators_vec,
             voting_power,
             metadata_adapter,
             heuristic,
@@ -450,7 +470,10 @@ impl DagBootstrapper {
                         let commit_events = self
                             .storage
                             .get_latest_k_committed_events(
-                                config.voter_window_num_validators_multiplier as u64
+                                std::cmp::max(
+                                    config.proposer_window_num_validators_multiplier,
+                                    config.voter_window_num_validators_multiplier,
+                                ) as u64
                                     * self.epoch_state.verifier.len() as u64,
                             )
                             .expect("Failed to read commit events from storage");
@@ -513,6 +536,7 @@ impl DagBootstrapper {
             self.epoch_state.clone(),
             parent_block_info,
             ledger_info_provider.clone(),
+            self.allow_batches_without_pos_in_proposal,
         ));
 
         let order_rule = Arc::new(Mutex::new(OrderRule::new(
@@ -547,6 +571,7 @@ impl DagBootstrapper {
             .factor(rb_config.backoff_policy_factor)
             .max_delay(Duration::from_millis(rb_config.backoff_policy_max_delay_ms));
         let rb = Arc::new(ReliableBroadcast::new(
+            self.self_peer,
             validators.clone(),
             self.rb_network_sender.clone(),
             rb_backoff_policy,
@@ -601,6 +626,8 @@ impl DagBootstrapper {
                     .health_config
                     .pipeline_backpressure_config
                     .clone(),
+                // TODO: add pipeline backpressure based on execution speed to DAG config
+                None,
             ),
             ordered_notifier.clone(),
         );
@@ -622,6 +649,7 @@ impl DagBootstrapper {
             self.config.node_payload_config.clone(),
             health_backoff.clone(),
             self.quorum_store_enabled,
+            self.allow_batches_without_pos_in_proposal,
         );
         let rb_handler = NodeBroadcastHandler::new(
             dag_store.clone(),
@@ -632,7 +660,8 @@ impl DagBootstrapper {
             fetch_requester,
             self.config.node_payload_config.clone(),
             self.vtxn_config.clone(),
-            self.features.clone(),
+            self.randomness_config.clone(),
+            self.jwk_consensus_config.clone(),
             health_backoff,
         );
         let fetch_handler = FetchRequestHandler::new(dag_store.clone(), self.epoch_state.clone());
@@ -709,7 +738,7 @@ pub(super) fn bootstrap_dag_for_test(
     dag_network_sender: Arc<dyn TDAGNetworkSender>,
     proof_notifier: Arc<dyn ProofNotifier>,
     time_service: aptos_time_service::TimeService,
-    payload_manager: Arc<PayloadManager>,
+    payload_manager: Arc<dyn TPayloadManager>,
     payload_client: Arc<dyn PayloadClient>,
     execution_client: Arc<dyn TExecutionClient>,
 ) -> (
@@ -719,8 +748,6 @@ pub(super) fn bootstrap_dag_for_test(
     UnboundedReceiver<OrderedBlocks>,
 ) {
     let (ordered_nodes_tx, ordered_nodes_rx) = futures_channel::mpsc::unbounded();
-    let mut features = Features::default();
-    features.enable(FeatureFlag::RECONFIGURE_WITH_DKG);
     let bootstraper = DagBootstrapper::new(
         self_peer,
         DagConsensusConfig::default(),
@@ -738,8 +765,10 @@ pub(super) fn bootstrap_dag_for_test(
         execution_client,
         false,
         ValidatorTxnConfig::default_enabled(),
+        OnChainRandomnessConfig::default_enabled(),
+        OnChainJWKConsensusConfig::default_enabled(),
         BoundedExecutor::new(2, Handle::current()),
-        features,
+        true,
     );
 
     let (_base_state, handler, fetch_service) = bootstraper.full_bootstrap();

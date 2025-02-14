@@ -1,4 +1,4 @@
-// ---- Model Dump
+// -- Model dump before bytecode pipeline
 module <SELF>_0 {
     private fun main() {
         if false {
@@ -8,8 +8,14 @@ module <SELF>_0 {
         };
         Tuple()
     }
-    spec fun $main();
 } // end <SELF>_0
+
+// -- Sourcified model before bytecode pipeline
+script {
+    fun main() {
+        if (false) () else break;
+    }
+}
 
 
 Diagnostics:

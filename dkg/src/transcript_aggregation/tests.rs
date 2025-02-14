@@ -1,4 +1,5 @@
 // Copyright © Aptos Foundation
+// SPDX-License-Identifier: Apache-2.0
 
 use crate::transcript_aggregation::TranscriptAggregationState;
 use aptos_crypto::{bls12381::bls12381_keys, Uniform};
@@ -10,6 +11,7 @@ use aptos_types::{
         DKGSessionMetadata, DKGTrait, DKGTranscript, DKGTranscriptMetadata,
     },
     epoch_state::EpochState,
+    on_chain_config::OnChainRandomnessConfig,
     validator_verifier::{
         ValidatorConsensusInfo, ValidatorConsensusInfoMoveStruct, ValidatorVerifier,
     },
@@ -43,10 +45,11 @@ fn test_transcript_aggregation_state() {
     let verifier = ValidatorVerifier::new(validator_infos.clone());
     let pub_params = DummyDKG::new_public_params(&DKGSessionMetadata {
         dealer_epoch: 999,
+        randomness_config: OnChainRandomnessConfig::default_enabled().into(),
         dealer_validator_set: validator_consensus_info_move_structs.clone(),
         target_validator_set: validator_consensus_info_move_structs.clone(),
     });
-    let epoch_state = Arc::new(EpochState { epoch, verifier });
+    let epoch_state = Arc::new(EpochState::new(epoch, verifier));
     let trx_agg_state = Arc::new(TranscriptAggregationState::<DummyDKG>::new(
         duration_since_epoch(),
         addrs[0],

@@ -1,4 +1,5 @@
 // Copyright © Aptos Foundation
+// SPDX-License-Identifier: Apache-2.0
 
 use crate::{block_metadata::BlockMetadata, randomness::Randomness};
 use aptos_crypto::HashValue;
@@ -101,6 +102,13 @@ impl BlockMetadataExt {
         match self {
             BlockMetadataExt::V0(obj) => obj.round(),
             BlockMetadataExt::V1(obj) => obj.round,
+        }
+    }
+
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            BlockMetadataExt::V0(_) => "block_metadata_ext_transaction__v0",
+            BlockMetadataExt::V1(_) => "block_metadata_ext_transaction__v1",
         }
     }
 }

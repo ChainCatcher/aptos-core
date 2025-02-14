@@ -17,7 +17,8 @@ use serde::Serialize;
 use signature::Verifier;
 use std::{cmp::Ordering, fmt};
 
-/// A Secp256r1 ECDSA signature
+/// A secp256r1 ECDSA signature.
+/// NOTE: The max size on this struct is enforced in its `TryFrom<u8>` trait implementation.
 #[derive(DeserializeKey, Clone, SerializeKey)]
 #[key_name("Secp256r1EcdsaSignature")]
 pub struct Signature(pub(crate) p256::ecdsa::Signature);
@@ -34,7 +35,7 @@ impl Signature {
 
     /// Deserialize an P256Signature, without checking for malleability
     /// Uses the SEC1 serialization format.
-    pub(crate) fn from_bytes_unchecked(
+    pub fn from_bytes_unchecked(
         bytes: &[u8],
     ) -> std::result::Result<Signature, CryptoMaterialError> {
         match p256::ecdsa::Signature::try_from(bytes) {

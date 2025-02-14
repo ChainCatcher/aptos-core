@@ -1,4 +1,5 @@
 // Copyright © Aptos Foundation
+// SPDX-License-Identifier: Apache-2.0
 
 use crate::{
     agg_trx_producer::DummyAggTranscriptProducer,
@@ -18,6 +19,7 @@ use aptos_types::{
         DKGTranscriptMetadata,
     },
     epoch_state::EpochState,
+    on_chain_config::OnChainRandomnessConfig,
     validator_txn::ValidatorTransaction,
     validator_verifier::{
         ValidatorConsensusInfo, ValidatorConsensusInfoMoveStruct, ValidatorVerifier,
@@ -53,7 +55,7 @@ async fn test_dkg_state_transition() {
         .collect::<Vec<_>>();
     let epoch_state = EpochState {
         epoch: 999,
-        verifier: ValidatorVerifier::new(validator_consensus_infos.clone()),
+        verifier: Arc::new(ValidatorVerifier::new(validator_consensus_infos.clone())),
     };
     let agg_node_producer = DummyAggTranscriptProducer {};
     let mut dkg_manager: DKGManager<DummyDKG> = DKGManager::new(
@@ -84,6 +86,7 @@ async fn test_dkg_state_transition() {
     let event = DKGStartEvent {
         session_metadata: DKGSessionMetadata {
             dealer_epoch: 999,
+            randomness_config: OnChainRandomnessConfig::default_enabled().into(),
             dealer_validator_set: validator_consensus_info_move_structs.clone(),
             target_validator_set: validator_consensus_info_move_structs.clone(),
         },

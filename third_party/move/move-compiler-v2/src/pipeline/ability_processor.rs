@@ -9,35 +9,34 @@
 //! - It infers the `AssignKind` in the assign statement. This will be `Move` if
 //!   the source is not used after the assignment and is not borrowed. It will
 //!   be Copy otherwise.
-//! - It inserts a `Copy` assignment for every function argument which is used later or borrowed
-//!   (same condition as above)
+//! - It inserts a `Copy` assignment for every function or operator argument which is
+//!   borrowed.
 //! - It inserts a `Drop` instruction for values which go out of scope and are not
 //!   consumed by any call and no longer borrowed.
 //!
 //! For the checking part, consider the transformation to have happened,
 //! then:
 //!
-//! - Every copied value must have the `copy` ability
+//! - Every copied value must have the `copy` ability. This includes values for which we do
+//!   not generate a `Copy` instruction, but for every temporary which is used later
+//!   or is borrowed.
 //! - Every dropped value must have the `drop` ability
-//! - Every type used in storage operations must have the `key` ability (TODO(#12036): this check should
-//!   go the the frontend where also `store` is checked)
-//! - All type instantiations in the program must satisfy ability constraints (TODO: also frontend)
 //!
 //! Precondition: LiveVarAnnotation, LifetimeAnnotation, ExitStateAnnotation
 
 use crate::pipeline::{
     exit_state_analysis::ExitStateAnnotation, livevar_analysis_processor::LiveVarAnnotation,
-    reference_safety_processor::LifetimeAnnotation,
+    reference_safety::LifetimeAnnotation,
 };
 use abstract_domain_derive::AbstractDomain;
 use codespan_reporting::diagnostic::Severity;
-use move_binary_format::file_format::{Ability, AbilitySet, CodeOffset};
+use move_binary_format::file_format::CodeOffset;
+use move_core_types::ability::Ability;
 use move_model::{
     ast::TempIndex,
     exp_generator::ExpGenerator,
-    model::{FunId, FunctionEnv, GlobalEnv, Loc, ModuleId, StructId, TypeParameterKind},
-    ty,
-    ty::{gen_get_ty_param_kinds, Type},
+    model::{FunctionEnv, GlobalEnv, Loc},
+    ty::Type,
 };
 use move_stackless_bytecode::{
     dataflow_analysis::{DataflowAnalysis, TransferFunctions},
@@ -48,7 +47,7 @@ use move_stackless_bytecode::{
     stackless_bytecode::{AssignKind, AttrId, Bytecode, Operation},
     stackless_control_flow_graph::StacklessControlFlowGraph,
 };
-use std::{collections::BTreeMap, iter};
+use std::collections::BTreeMap;
 
 // =================================================================================================
 // Processor
@@ -113,6 +112,8 @@ impl FunctionTargetProcessor for AbilityProcessor {
             copy_drop,
         };
         transformer.run(code);
+        // Clear annotations as code has changed
+        transformer.builder.data.annotations.clear();
         transformer.builder.data
     }
 
@@ -156,17 +157,14 @@ impl<'a> TransferFunctions for CopyDropAnalysis<'a> {
         // Clear local state info
         state.needs_copy.clear();
         state.needs_drop.clear();
+        state.check_drop.clear();
         let live_var = self.live_var.get_info_at(offset);
         let lifetime = self.lifetime.get_info_at(offset);
         let exit_state = self.exit_state.get_state_at(offset);
-        // Only non-primitive types need a copy
-        let type_needs_copy = |temp: &TempIndex| {
-            let ty = self.target.get_local_type(*temp);
-            !ty.is_primitive()
-        };
         // Only temps which are used after or borrowed need a copy
-        let temp_needs_copy =
-            |temp| live_var.after.contains_key(temp) || lifetime.before.is_borrowed(*temp);
+        let temp_needs_copy = |temp, instr| {
+            live_var.is_temp_used_after(temp, instr) || lifetime.borrow_kind_before(*temp).is_some()
+        };
         // References always need to be dropped to satisfy bytecode verifier borrow analysis, other values
         // only if this execution path can return.
         let temp_needs_drop = |temp: &TempIndex| {
@@ -174,7 +172,7 @@ impl<'a> TransferFunctions for CopyDropAnalysis<'a> {
         };
         match instr {
             Assign(_, _, src, AssignKind::Inferred) => {
-                if temp_needs_copy(src) {
+                if temp_needs_copy(src, instr) {
                     state.needs_copy.insert(*src);
                 } else {
                     state.moved.insert(*src);
@@ -187,17 +185,15 @@ impl<'a> TransferFunctions for CopyDropAnalysis<'a> {
                 // Operation does not consume operands.
             },
             Call(_, _, op, srcs, ..) => {
-                // If this is an equality we need to check drop for the operands, even though we do not need
-                // to emit a drop.
+                // If this is an equality we need to check drop for the operands,
+                // even though we do not need to emit a drop.
                 if matches!(op, Operation::Eq | Operation::Neq) {
                     state.check_drop.extend(srcs.iter().cloned())
                 }
-                // For arguments, we also need to check the case that a src, even if not used after this program
-                // point, is again used in the argument list. Also, in difference to assign inference, we only need
-                // to copy the argument if its not primitive.
+                // For arguments, we also need to check the case that a src, even
+                // if not used after this program point, is again used in the argument list.
                 for (i, src) in srcs.iter().enumerate() {
-                    if (temp_needs_copy(src) || srcs[i + 1..].contains(src)) && type_needs_copy(src)
-                    {
+                    if temp_needs_copy(src, instr) || srcs[i + 1..].contains(src) {
                         state.needs_copy.insert(*src);
                     } else {
                         state.moved.insert(*src);
@@ -244,6 +240,22 @@ struct Transformer<'a> {
 
 impl<'a> Transformer<'a> {
     fn run(&mut self, code: Vec<Bytecode>) {
+        // Check and insert drop for parameters before the first instruction if it is a return
+        if !code.is_empty() && code.first().unwrap().is_return() {
+            let instr = code.first().unwrap();
+            for temp in self
+                .live_var
+                .0
+                .get(&0)
+                .unwrap()
+                .released_and_unused_temps(instr)
+            {
+                if temp < self.builder.fun_env.get_parameters().len() {
+                    self.copy_drop.get_mut(&0).unwrap().needs_drop.insert(temp);
+                }
+            }
+            self.check_and_add_implicit_drops(0, instr, true);
+        }
         for (offset, bc) in code.into_iter().enumerate() {
             self.transform_bytecode(offset as CodeOffset, bc)
         }
@@ -275,20 +287,13 @@ impl<'a> Transformer<'a> {
                 },
             },
             Call(id, dests, op, srcs, ai) => {
-                use Operation::*;
-                match &op {
-                    Function(mod_id, fun_id, insts) => {
-                        self.check_fun_inst(id, *mod_id, *fun_id, insts);
-                        let new_srcs = self.copy_args_if_needed(code_offset, id, srcs);
-                        self.check_and_emit_bytecode(code_offset, Call(id, dests, op, new_srcs, ai))
-                    },
-                    _ => self.check_and_emit_bytecode(code_offset, bc.clone()),
-                }
+                let new_srcs = self.copy_args_if_needed(code_offset, id, srcs);
+                self.check_and_emit_bytecode(code_offset, Call(id, dests, op, new_srcs, ai))
             },
             _ => self.check_and_emit_bytecode(code_offset, bc.clone()),
         }
         // Insert/check any drops needed after this program point
-        self.check_and_add_implicit_drops(code_offset, &bc)
+        self.check_and_add_implicit_drops(code_offset, &bc, false)
     }
 
     fn check_and_emit_bytecode(&mut self, _code_offset: CodeOffset, bc: Bytecode) {
@@ -298,18 +303,6 @@ impl<'a> Transformer<'a> {
             Call(id, _, op, srcs, _) => {
                 use Operation::*;
                 match &op {
-                    Function(mod_id, fun_id, insts) => {
-                        self.check_fun_inst(*id, *mod_id, *fun_id, insts);
-                    },
-                    Unpack(mod_id, struct_id, insts) | Pack(mod_id, struct_id, insts) => {
-                        self.check_struct_inst(*id, *mod_id, *struct_id, insts);
-                    },
-                    BorrowGlobal(mod_id, struct_id, insts)
-                    | Exists(mod_id, struct_id, insts)
-                    | MoveFrom(mod_id, struct_id, insts)
-                    | MoveTo(mod_id, struct_id, insts) => {
-                        self.check_key_for_struct(*id, *mod_id, *struct_id, insts)
-                    },
                     Drop => self.check_drop(*id, srcs[0], || {
                         ("explicitly dropped here".to_string(), vec![])
                     }),
@@ -370,10 +363,22 @@ impl<'a> Transformer<'a> {
         for src in srcs.iter() {
             if copy_drop_at.needs_copy.contains(src) {
                 self.check_implicit_copy(code_offset, id, *src);
-                let ty = self.builder.get_local_type(*src);
-                let temp = self.builder.new_temp(ty);
-                self.builder.emit(Assign(id, temp, *src, AssignKind::Copy));
-                new_srcs.push(temp)
+                // Only need to perform the actual copy if src is borrowed, as this
+                // information cannot be determined from live-var analysis in later
+                // phases.
+                if self
+                    .lifetime
+                    .get_info_at(code_offset)
+                    .borrow_kind_after(*src)
+                    .is_some()
+                {
+                    let ty = self.builder.get_local_type(*src);
+                    let temp = self.builder.new_temp(ty);
+                    self.builder.emit(Assign(id, temp, *src, AssignKind::Copy));
+                    new_srcs.push(temp)
+                } else {
+                    new_srcs.push(*src)
+                }
             } else {
                 new_srcs.push(*src)
             }
@@ -420,15 +425,20 @@ impl<'a> Transformer<'a> {
 
 impl<'a> Transformer<'a> {
     /// Add implicit drops at the given code offset.
-    fn check_and_add_implicit_drops(&mut self, code_offset: CodeOffset, bytecode: &Bytecode) {
-        // No drop after terminators
-        if !bytecode.is_always_branching() {
+    fn check_and_add_implicit_drops(
+        &mut self,
+        code_offset: CodeOffset,
+        bytecode: &Bytecode,
+        before: bool,
+    ) {
+        // No drop after terminators unless it is dropped before a return
+        if !bytecode.is_always_branching() || before {
             let copy_drop_at = self.copy_drop.get(&code_offset).expect("copy_drop");
             let id = bytecode.get_attr_id();
             for temp in copy_drop_at.check_drop.iter() {
                 self.check_drop(bytecode.get_attr_id(), *temp, || {
                     (
-                        "operator drops value here (consider to borrow the argument)".to_string(),
+                        "operator drops value here (consider borrowing the argument)".to_string(),
                         vec![],
                     )
                 });
@@ -438,8 +448,8 @@ impl<'a> Transformer<'a> {
                 let is_borrowed = self
                     .lifetime
                     .get_info_at(code_offset)
-                    .after
-                    .is_borrowed(*temp);
+                    .borrow_kind_after(*temp)
+                    .is_some();
                 self.check_drop(bytecode.get_attr_id(), *temp, || {
                     (
                         if is_borrowed {
@@ -481,98 +491,6 @@ impl<'a> Transformer<'a> {
         describe: impl FnOnce() -> Description,
     ) {
         self.check_ability_for_type(id, Some(temp), ty, Ability::Drop, describe)
-    }
-}
-
-// ---------------------------------------------------------------------------------------------------------
-// Abilities in Types
-
-// TODO(#12036): this functionality should be moved to the frontend
-
-impl<'a> Transformer<'a> {
-    /// Check whether a function has a valid type instantiation.
-    fn check_fun_inst(&self, id: AttrId, mid: ModuleId, fid: FunId, inst: &[Type]) {
-        let ty_params = self.builder.fun_env.get_type_parameters();
-        let fun_env = self.env().get_function(mid.qualified(fid));
-        let err_handler = |loc: &Loc, ty: &Type, msg: &str| {
-            self.error(
-                loc,
-                format!("type `{}` is {}", self.display_ty(ty), msg),
-                format!(
-                    "in instantiation of function `{}` here",
-                    fun_env.get_full_name_str()
-                ),
-            )
-        };
-        let loc = self.loc(id);
-        for (param, ty) in fun_env.get_type_parameters().iter().zip(inst.iter()) {
-            let required_abilities = param.1.abilities;
-            let given_abilities = ty::infer_and_check_abilities(
-                ty,
-                gen_get_ty_param_kinds(&ty_params),
-                self.gen_get_struct_sig(),
-                &loc,
-                err_handler,
-            );
-            ty::check_type_arg_abilities(
-                ty::gen_get_ty_param_kinds(&ty_params),
-                ty,
-                required_abilities,
-                false,
-                given_abilities,
-                &loc,
-                err_handler,
-            )
-        }
-    }
-
-    /// Check whether a struct has a valid type instantiation.
-    fn check_struct_inst(
-        &self,
-        id: AttrId,
-        mid: ModuleId,
-        sid: StructId,
-        inst: &[Type],
-    ) -> AbilitySet {
-        let ty_params = self.builder.fun_env.get_type_parameters();
-        let struct_env = self.env().get_struct(mid.qualified(sid));
-        ty::check_struct_inst(
-            mid,
-            sid,
-            inst,
-            ty::gen_get_ty_param_kinds(&ty_params),
-            self.gen_get_struct_sig(),
-            Some((&self.loc(id), |loc: &Loc, ty: &Type, msg: &str| {
-                self.error(
-                    loc,
-                    format!("type `{}` is {}", self.display_ty(ty), msg),
-                    format!(
-                        "in instantiation of struct `{}` here",
-                        struct_env.get_full_name_str()
-                    ),
-                )
-            })),
-        )
-    }
-
-    /// Check whether a struct has a valid type instantiation and has the `key` ability.
-    fn check_key_for_struct(&self, id: AttrId, mid: ModuleId, sid: StructId, inst: &[Type]) {
-        self.check_struct_inst(id, mid, sid, inst);
-        let ty = mid.qualified_inst(sid, inst.to_vec()).to_type();
-        self.check_ability_for_type(id, None, &ty, Ability::Key, || {
-            (
-                "required because of storage operation here".to_string(),
-                vec![],
-            )
-        })
-    }
-
-    /// Generates a function that given module id and struct id, returns the struct signature
-    /// as it is expected by the ability functions in `ty`.
-    fn gen_get_struct_sig(
-        &'a self,
-    ) -> impl Fn(ModuleId, StructId) -> (Vec<TypeParameterKind>, AbilitySet) + Copy + 'a {
-        self.env().gen_get_struct_sig()
     }
 }
 
@@ -656,11 +574,6 @@ impl<'a> Transformer<'a> {
         )
     }
 
-    /// Shortcut if hints are empty
-    fn error(&self, loc: impl AsRef<Loc>, msg: impl AsRef<str>, primary: impl AsRef<str>) {
-        self.error_with_hints(loc, msg, primary, iter::empty())
-    }
-
     /// Create a display string for temps. If the temp is printable, this will be 'local `x`'. Otherwise
     /// it will be just 'local'.
     fn display_temp(&self, temp: TempIndex) -> String {
@@ -682,9 +595,9 @@ impl<'a> Transformer<'a> {
         temp: TempIndex,
     ) -> Vec<(Loc, String)> {
         if let Some(info) = self.live_var.get_info_at(code_offset).after.get(&temp) {
-            info.usages
-                .iter()
-                .map(|loc| (loc.clone(), "used here".to_owned()))
+            info.usage_locations()
+                .into_iter()
+                .map(|loc| (loc, "used here".to_owned()))
                 .collect()
         } else {
             vec![]

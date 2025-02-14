@@ -6,7 +6,8 @@ use aptos_cached_packages::aptos_stdlib::aptos_account_transfer;
 use aptos_types::{
     state_store::state_key::StateKey, transaction::ExecutionStatus, write_set::WriteOp,
 };
-use aptos_vm::{data_cache::AsMoveResolver, AptosVM};
+use aptos_vm::AptosVM;
+use aptos_vm_environment::environment::AptosEnvironment;
 use claims::{assert_ok_eq, assert_some};
 use move_core_types::vm_status::{StatusCode, VMStatus};
 use test_case::test_case;
@@ -28,10 +29,8 @@ fn failed_transaction_cleanup_charges_gas(status_code: StatusCode) {
         .sign();
 
     let state_view = h.executor.get_state_view();
-    let vm = AptosVM::new(
-        &state_view.as_move_resolver(),
-        /*override_is_delayed_field_optimization_capable=*/ Some(false),
-    );
+    let env = AptosEnvironment::new(&state_view);
+    let vm = AptosVM::new(env, state_view);
 
     let balance = 10_000;
     let output = vm
@@ -42,9 +41,7 @@ fn failed_transaction_cleanup_charges_gas(status_code: StatusCode) {
             balance,
         )
         .1;
-
     let write_set: Vec<(&StateKey, &WriteOp)> = output
-        .change_set()
         .concrete_write_set_iter()
         .map(|(k, v)| (k, assert_some!(v)))
         .collect();

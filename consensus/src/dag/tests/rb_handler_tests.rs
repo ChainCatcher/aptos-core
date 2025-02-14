@@ -19,7 +19,7 @@ use aptos_config::config::DagPayloadConfig;
 use aptos_types::{
     aggregate_signature::PartialSignatures,
     epoch_state::EpochState,
-    on_chain_config::{Features, ValidatorTxnConfig},
+    on_chain_config::{OnChainJWKConsensusConfig, OnChainRandomnessConfig, ValidatorTxnConfig},
     validator_verifier::random_validator_verifier,
 };
 use claims::{assert_ok, assert_ok_eq};
@@ -43,7 +43,7 @@ async fn test_node_broadcast_receiver_succeed() {
     let (signers, validator_verifier) = random_validator_verifier(4, None, false);
     let epoch_state = Arc::new(EpochState {
         epoch: 1,
-        verifier: validator_verifier.clone(),
+        verifier: validator_verifier.into(),
     });
     let signers: Vec<_> = signers.into_iter().map(Arc::new).collect();
 
@@ -78,7 +78,8 @@ async fn test_node_broadcast_receiver_succeed() {
         Arc::new(MockFetchRequester {}),
         DagPayloadConfig::default(),
         ValidatorTxnConfig::default_disabled(),
-        Features::default(),
+        OnChainRandomnessConfig::default_disabled(),
+        OnChainJWKConsensusConfig::default_disabled(),
         health_backoff,
     );
 
@@ -100,6 +101,7 @@ async fn test_node_broadcast_receiver_succeed() {
 #[tokio::test]
 async fn test_node_broadcast_receiver_failure() {
     let (signers, validator_verifier) = random_validator_verifier(4, None, false);
+    let validator_verifier = Arc::new(validator_verifier);
     let epoch_state = Arc::new(EpochState {
         epoch: 1,
         verifier: validator_verifier.clone(),
@@ -128,7 +130,8 @@ async fn test_node_broadcast_receiver_failure() {
                 Arc::new(MockFetchRequester {}),
                 DagPayloadConfig::default(),
                 ValidatorTxnConfig::default_disabled(),
-                Features::default(),
+                OnChainRandomnessConfig::default_disabled(),
+                OnChainJWKConsensusConfig::default_disabled(),
                 HealthBackoff::new(
                     epoch_state.clone(),
                     NoChainHealth::new(),
@@ -150,7 +153,7 @@ async fn test_node_broadcast_receiver_failure() {
     let node_cert = NodeCertificate::new(
         node.metadata().clone(),
         validator_verifier
-            .aggregate_signatures(&partial_sigs)
+            .aggregate_signatures(partial_sigs.signatures_iter())
             .unwrap(),
     );
     let node = new_node(2, 20, signers[0].author(), vec![node_cert]);
@@ -175,7 +178,7 @@ async fn test_node_broadcast_receiver_failure() {
             NodeCertificate::new(
                 node.metadata().clone(),
                 validator_verifier
-                    .aggregate_signatures(&partial_sigs)
+                    .aggregate_signatures(partial_sigs.signatures_iter())
                     .unwrap(),
             )
         })
@@ -195,7 +198,7 @@ async fn test_node_broadcast_receiver_storage() {
     let signers: Vec<_> = signers.into_iter().map(Arc::new).collect();
     let epoch_state = Arc::new(EpochState {
         epoch: 1,
-        verifier: validator_verifier,
+        verifier: validator_verifier.into(),
     });
 
     let storage = Arc::new(MockStorage::new());
@@ -219,7 +222,8 @@ async fn test_node_broadcast_receiver_storage() {
         Arc::new(MockFetchRequester {}),
         DagPayloadConfig::default(),
         ValidatorTxnConfig::default_disabled(),
-        Features::default(),
+        OnChainRandomnessConfig::default_disabled(),
+        OnChainJWKConsensusConfig::default_disabled(),
         HealthBackoff::new(
             epoch_state.clone(),
             NoChainHealth::new(),
@@ -242,7 +246,8 @@ async fn test_node_broadcast_receiver_storage() {
         Arc::new(MockFetchRequester {}),
         DagPayloadConfig::default(),
         ValidatorTxnConfig::default_disabled(),
-        Features::default(),
+        OnChainRandomnessConfig::default_disabled(),
+        OnChainJWKConsensusConfig::default_disabled(),
         HealthBackoff::new(
             epoch_state,
             NoChainHealth::new(),

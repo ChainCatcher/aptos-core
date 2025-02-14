@@ -1,4 +1,5 @@
 // Copyright © Aptos Foundation
+// SPDX-License-Identifier: Apache-2.0
 
 use crate::{
     invalid_signature,
@@ -6,6 +7,7 @@ use crate::{
         circuit_constants, circuit_testcases::SAMPLE_EXP_HORIZON_SECS, KEYLESS_ACCOUNT_MODULE_NAME,
     },
     move_utils::as_move_value::AsMoveValue,
+    on_chain_config::OnChainConfig,
 };
 use move_core_types::{
     ident_str,
@@ -17,7 +19,7 @@ use move_core_types::{
 use serde::{Deserialize, Serialize};
 
 /// Reflection of aptos_framework::keyless_account::Configuration
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Eq, PartialEq, Debug)]
 pub struct Configuration {
     pub override_aud_vals: Vec<String>,
     pub max_signatures_per_txn: u16,
@@ -53,7 +55,7 @@ impl MoveStructType for Configuration {
 
 impl Configuration {
     /// Should only be used for testing.
-    pub const OVERRIDE_AUD_FOR_TESTING: &'static str = "some_override_aud";
+    pub const OVERRIDE_AUD_FOR_TESTING: &'static str = "test.recovery.aud";
 
     pub fn new_for_devnet() -> Configuration {
         Configuration {
@@ -90,4 +92,9 @@ impl Configuration {
             Ok(())
         }
     }
+}
+
+impl OnChainConfig for Configuration {
+    const MODULE_IDENTIFIER: &'static str = KEYLESS_ACCOUNT_MODULE_NAME;
+    const TYPE_IDENTIFIER: &'static str = "Configuration";
 }

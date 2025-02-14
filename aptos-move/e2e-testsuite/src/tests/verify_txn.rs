@@ -40,7 +40,7 @@ fn verify_signature() {
         *sender.address(),
         0,
         &private_key,
-        sender.account().pubkey.clone(),
+        sender.account().pubkey.as_ed25519().unwrap(),
         program,
     );
 
@@ -70,9 +70,9 @@ fn verify_multi_agent_invalid_sender_signature() {
         vec![*secondary_signer.address()],
         10,
         &private_key,
-        sender.account().pubkey.clone(),
+        sender.account().pubkey.as_ed25519().unwrap(),
         vec![&secondary_signer.account().privkey],
-        vec![secondary_signer.account().pubkey.clone()],
+        vec![secondary_signer.account().pubkey.as_ed25519().unwrap()],
         None,
     );
     assert_prologue_parity!(
@@ -100,9 +100,9 @@ fn verify_multi_agent_invalid_secondary_signature() {
         vec![*secondary_signer.address()],
         10,
         &sender.account().privkey,
-        sender.account().pubkey.clone(),
+        sender.account().pubkey.as_ed25519().unwrap(),
         vec![&private_key],
-        vec![secondary_signer.account().pubkey.clone()],
+        vec![secondary_signer.account().pubkey.as_ed25519().unwrap()],
         None,
     );
     assert_prologue_parity!(
@@ -134,16 +134,16 @@ fn verify_multi_agent_duplicate_secondary_signer() {
         ],
         10,
         &sender.account().privkey,
-        sender.account().pubkey.clone(),
+        sender.account().pubkey.as_ed25519().unwrap(),
         vec![
             &secondary_signer.account().privkey,
             &third_signer.account().privkey,
             &secondary_signer.account().privkey,
         ],
         vec![
-            secondary_signer.account().pubkey.clone(),
-            third_signer.account().pubkey.clone(),
-            secondary_signer.account().pubkey.clone(),
+            secondary_signer.account().pubkey.as_ed25519().unwrap(),
+            third_signer.account().pubkey.as_ed25519().unwrap(),
+            secondary_signer.account().pubkey.as_ed25519().unwrap(),
         ],
         None,
     );
@@ -212,7 +212,10 @@ fn verify_simple_payment() {
         .max_gas_amount(100_000)
         .gas_unit_price(1)
         .raw()
-        .sign(&sender.account().privkey, sender.account().pubkey.clone())
+        .sign(
+            &sender.account().privkey,
+            sender.account().pubkey.as_ed25519().unwrap(),
+        )
         .unwrap()
         .into_inner();
 
@@ -301,9 +304,8 @@ fn verify_simple_payment() {
 
     // Test for a max_gas_amount that is insufficient to pay the minimum fee.
     // Find the minimum transaction gas units and subtract 1.
-    let mut gas_limit: Gas = txn_gas_params
-        .min_transaction_gas_units
-        .to_unit_round_up_with_params(&txn_gas_params);
+    let mut gas_limit: Gas =
+        (txn_gas_params.min_transaction_gas_units).to_unit_round_up_with_params(&txn_gas_params);
 
     if gas_limit > 0.into() {
         gas_limit = gas_limit.checked_sub(1.into()).unwrap();
@@ -654,7 +656,7 @@ fn test_type_tag_dependency_fails_verification() {
                 address: account_config::CORE_CODE_ADDRESS,
                 module: Identifier::new("Test").unwrap(),
                 name: Identifier::new("S1").unwrap(),
-                type_params: vec![],
+                type_args: vec![],
             }))],
             vec![],
         ))
@@ -762,7 +764,7 @@ fn test_type_tag_transitive_dependency_fails_verification() {
                 address: account_config::CORE_CODE_ADDRESS,
                 module: Identifier::new("Test2").unwrap(),
                 name: Identifier::new("S").unwrap(),
-                type_params: vec![],
+                type_args: vec![],
             }))],
             vec![],
         ))
