@@ -114,6 +114,7 @@ use move_model::{
         CONDITION_INFERRED_PROP, CONDITION_INFERRED_SATHARD, CONDITION_INFERRED_VACUOUS,
         INFERENCE_PRAGMA, OPAQUE_PRAGMA,
     },
+    pureness_checker::{FunctionPurenessChecker, FunctionPurenessCheckerMode},
     sourcifier::Sourcifier,
     symbol::Symbol,
     ty::{PrimitiveType, Type, BOOL_TYPE, NUM_TYPE},
@@ -940,7 +941,7 @@ fn update_spec<'env>(
         .map(|e| stripper.rewrite_exp(e.clone()))
         .collect();
 
-    // Add each ensures condition separately, filtering out trivial `true` conditions.
+    // Add each ensures condition separately, filtering out trivial `true` conditions
     if infer_ensures {
         let ensures_conds: Vec<_> = stripped_ensures
             .iter()
@@ -1042,14 +1043,21 @@ fn exp_node_count(exp: &ExpData) -> usize {
 /// Only extract function calls and pack operations — not field accesses, variant tests,
 /// or other small operations that are more readable inline.
 fn is_cse_candidate(exp: &ExpData) -> bool {
-    matches!(
+    if !matches!(
         exp,
         ExpData::Call(
             _,
             AstOp::MoveFunction(..) | AstOp::SpecFunction(..) | AstOp::Pack(..),
             _
         )
-    )
+    ) {
+        return false;
+    }
+    // Don't hoist subexpressions that contain quantifier-bound (free) local
+    // variables.  Such variables are only in scope inside the quantifier body;
+    // extracting the expression into a top-level `let` binding makes them
+    // undeclared and produces a compilation error (e.g., `undeclared x`).
+    exp.free_vars().is_empty()
 }
 
 /// Generates a readable name for a CSE binding based on expression structure.
@@ -3339,7 +3347,21 @@ impl<'env> SpecInferenceAnalyzer<'env> {
         }
 
         // &mut src post-values: src_j ↦ result_of<f>(args)[num_explicit + j]
+        //
+        // For &mut params that are ALREADY in captured_mut_params, do NOT add them
+        // to all_subs. Their old(param) pattern will be replaced by
+        // substitute_old_param_in_state below. Adding them here would cause
+        // substitute_multiple_temps_in_state to also replace `param` inside
+        // `old(param)` in the state (turning it into `old(result_of<...>)`),
+        // and then substitute_old_param_in_state would find another `old(param)`
+        // inside the substitution value and replace it again, producing a
+        // doubly-applied result_of — e.g. result_of<f>(result_of<f>(c, a), a)
+        // instead of the correct result_of<f>(c, a).
         for (j, (_, idx)) in mut_ref_srcs.iter().enumerate() {
+            if self.is_mut_ref_param(*idx) && state.captured_mut_params.contains(idx) {
+                // Already captured: handled exclusively by substitute_old_param_in_state.
+                continue;
+            }
             let result_exp = self.mk_result_of_at_with_state(
                 fun_exp.clone(),
                 args.clone(),
@@ -3698,6 +3720,10 @@ impl<'env> SpecInferenceAnalyzer<'env> {
         {
             return None;
         }
+        // Must have an associated spec function with a body and no memory use.
+        // `spec_rewriter` removes the body (`body = None`) for any spec function that
+        // contains imperative expressions (Loop, Assign, Mutate, Return, LoopCont), so
+        // a callee whose spec fun has side-effects or a while-loop body is rejected here.
         let (spec_fun_id, decl) = callee.find_spec_fun()?;
         // Non-native functions without a derived body cannot be expressed as a
         // spec call — typical of effectful operations like `move_to`/`move_from`.
@@ -3709,6 +3735,23 @@ impl<'env> SpecInferenceAnalyzer<'env> {
         // Must not access global memory.
         if !decl.used_memory.is_empty() {
             return None;
+        }
+        // Additionally check the Move function body for specification-mode purity:
+        // no Assign, Return, uninitialized let, or mutable borrows.
+        // `FunctionPurenessChecker` traverses all sub-expressions including those
+        // nested inside Loop nodes, so a while-loop body containing Assign is caught.
+        if let Some(def) = callee.get_def() {
+            let mut is_pure = true;
+            let mut checker = FunctionPurenessChecker::new(
+                FunctionPurenessCheckerMode::Specification,
+                |_, _, _| {
+                    is_pure = false;
+                },
+            );
+            checker.check_exp(self.global_env(), def);
+            if !is_pure {
+                return None;
+            }
         }
         let result_type = callee.get_result_type().instantiate(type_inst);
         Some((spec_fun_id, result_type))

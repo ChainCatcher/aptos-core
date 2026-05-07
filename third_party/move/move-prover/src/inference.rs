@@ -33,7 +33,7 @@ use codespan_reporting::term::termcolor::WriteColor;
 #[allow(unused_imports)]
 use log::{debug, info};
 use move_model::{
-    ast::SpecBlockTarget,
+    ast::{ConditionKind, SpecBlockTarget},
     emitln,
     model::{FunctionEnv, GlobalEnv, VerificationScope},
     sourcifier::Sourcifier,
@@ -335,6 +335,19 @@ fn output_to_files(env: &GlobalEnv, inferred_sym: Symbol, options: &Options) -> 
             let module_id = module.get_id();
 
             let mut insertions: Vec<(usize, String)> = Vec::new();
+            // Track use module names already present in the spec file and those
+            // already scheduled for insertion, to prevent duplicate `use`
+            // declarations across multiple function spec blocks (Move spec `use`
+            // declarations share the module-level namespace).
+            let mut inserted_use_modules: std::collections::BTreeSet<String> = source
+                .lines()
+                .filter_map(|line| {
+                    let trimmed = line.trim();
+                    trimmed
+                        .strip_prefix("use ")
+                        .map(|rest| use_decl_module_path(rest.trim_end_matches(';').trim()))
+                })
+                .collect();
 
             // Find the position before the last `}` in the spec file — this is
             // the closing brace of the outer `spec module_name { }` block and
@@ -421,7 +434,8 @@ fn output_to_files(env: &GlobalEnv, inferred_sym: Symbol, options: &Options) -> 
                     );
 
                     let final_text = if is_single_line && !cond_text.is_empty() {
-                        format!("\n{}{}{}", use_text, cond_text, indent)
+                        let deduped_use = filter_new_uses(&use_text, &mut inserted_use_modules);
+                        format!("\n{}{}{}", deduped_use, cond_text, indent)
                     } else {
                         cond_text
                     };
@@ -429,18 +443,37 @@ fn output_to_files(env: &GlobalEnv, inferred_sym: Symbol, options: &Options) -> 
                     insertions.push((insert_pos, final_text));
 
                     if !is_single_line && !use_text.is_empty() {
-                        let use_insert_pos = source[open_brace_pos..]
-                            .find('\n')
-                            .map(|p| open_brace_pos + p + 1)
-                            .unwrap_or(open_brace_pos + 1);
-                        insertions.push((use_insert_pos, use_text));
+                        let deduped = filter_new_uses(&use_text, &mut inserted_use_modules);
+                        if !deduped.is_empty() {
+                            let use_insert_pos = source[open_brace_pos..]
+                                .find('\n')
+                                .map(|p| open_brace_pos + p + 1)
+                                .unwrap_or(open_brace_pos + 1);
+                            insertions.push((use_insert_pos, deduped));
+                        }
                     }
                 } else if let Some(insert_pos) = module_close_insert_pos {
                     // No existing spec block for this function — insert a full block
                     // before the closing `}` of the outer `spec module { }` block.
                     let indent = "    ";
                     let spec_text = generate_full_spec_block(env, &fun, inferred_sym, indent);
-                    insertions.push((insert_pos, format!("{}\n", spec_text)));
+                    // Filter duplicate `use` declarations from the new spec block
+                    // using the same tracking set as existing-block insertions.
+                    let mut filtered_spec: String = spec_text
+                        .lines()
+                        .filter(|line| {
+                            let trimmed = line.trim();
+                            if let Some(rest) = trimmed.strip_prefix("use ") {
+                                if let Some(m) = rest.trim_end_matches(';').rsplit("::").next() {
+                                    return inserted_use_modules.insert(m.to_string());
+                                }
+                            }
+                            true
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    filtered_spec.push('\n');
+                    insertions.push((insert_pos, format!("{}\n", filtered_spec)));
                 }
             }
 
@@ -584,10 +617,15 @@ fn output_unified(env: &GlobalEnv, inferred_sym: Symbol, options: &Options) -> a
 
             let fun_id = fun.get_id();
 
-            // Check if there's an existing standalone spec block for this function.
+            // Check if there's an existing standalone spec block for this function
+            // in the SOURCE file (not in a separate .spec.move file). Without the
+            // file_id check, spec blocks from a companion .spec.move file would be
+            // matched here, but their byte offsets belong to that file — indexing
+            // them into the source file's content produces wrong results and panics.
             let existing_spec_block = spec_block_infos.iter().find(|info| {
-                matches!(&info.target, SpecBlockTarget::Function(mid, fid)
-                    if *mid == module_id && *fid == fun_id)
+                info.loc.file_id() == file_id
+                    && matches!(&info.target, SpecBlockTarget::Function(mid, fid)
+                        if *mid == module_id && *fid == fun_id)
             });
 
             if let Some(spec_info) = existing_spec_block {
@@ -778,6 +816,54 @@ fn filter_redundant_uses(source: &str, use_text: &str) -> String {
     }
 }
 
+/// Filter `use_text` to only include `use` lines whose module names have not
+/// been seen before, then record those new module names in `seen`. This
+/// Normalise a `use` declaration's path to a canonical dedup key.
+/// Strips any alias (`… as Foo`) and brace-group (`…::{Self, Bar}`),
+/// returning the bare module path (e.g. `"0x1::signer"` or `"0x2::utils"`).
+fn use_decl_module_path(path: &str) -> String {
+    // Strip alias suffix: "0x1::foo as F" → "0x1::foo"
+    let path = if let Some(pos) = path.find(" as ") {
+        path[..pos].trim()
+    } else {
+        path
+    };
+    // Strip brace-group suffix: "0x1::foo::{Self, Bar}" → "0x1::foo"
+    let path = if let Some(pos) = path.find("::{") {
+        path[..pos].trim()
+    } else {
+        path
+    };
+    path.to_string()
+}
+
+/// Filter `use` lines in `use_text` that are already present in `seen`,
+/// adding newly emitted ones to `seen` so later blocks don't repeat them.
+/// Uses the full module path as the dedup key so distinct modules that share
+/// only a leaf name (e.g. `0x1::utils` vs `0x2::utils`) are kept separate.
+fn filter_new_uses(use_text: &str, seen: &mut std::collections::BTreeSet<String>) -> String {
+    if use_text.is_empty() {
+        return String::new();
+    }
+    let filtered: Vec<&str> = use_text
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("use ") {
+                let key = use_decl_module_path(rest.trim_end_matches(';').trim());
+                // `insert` returns true if the key was not already present.
+                return seen.insert(key);
+            }
+            true
+        })
+        .collect();
+    if filtered.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", filtered.join("\n"))
+    }
+}
+
 fn detect_indent(source: &str, byte_offset: usize) -> String {
     // Find the start of the line containing this offset.
     let line_start = source[..byte_offset]
@@ -824,7 +910,21 @@ fn generate_inferred_conditions(
         (orig_conds, orig_props, orig_proof)
     };
 
+    // Expose the user-written let-binding names to the sourcifier so that
+    // `print_behavior_target` can detect shadowing and emit fully-qualified
+    // function names when the bare name would resolve to a let-binding instead.
+    let user_let_names = original_conditions
+        .iter()
+        .filter_map(|c| match &c.kind {
+            ConditionKind::LetPre(sym, _) | ConditionKind::LetPost(sym, _) => Some(*sym),
+            _ => None,
+        })
+        .collect();
+    sourcifier.set_context_let_names(user_let_names);
+
     sourcifier.print_fun_spec(fun);
+
+    sourcifier.clear_context_let_names();
 
     // Restore original conditions, properties, and proof block.
     {
